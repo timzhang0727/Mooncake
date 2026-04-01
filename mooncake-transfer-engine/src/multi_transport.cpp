@@ -108,14 +108,16 @@ Status MultiTransport::submitTransfer(
     size_t task_id = batch_desc.task_list.size();
     batch_desc.task_list.resize(task_id + entries.size());
 
+    // Key: 传输协议后端的指针, Value: 属于该协议后端的任务列表
     std::unordered_map<Transport *, std::vector<Transport::TransferTask *> >
         submit_tasks;
+    
     for (auto &request : entries) {
         Transport *transport = nullptr;
-        auto status = selectTransport(request, transport);
+        auto status = selectTransport(request, transport);      // 为每个 request 查协议
         if (!status.ok()) return status;
         assert(transport);
-        auto &task = batch_desc.task_list[task_id];
+        auto &task = batch_desc.task_list[task_id];         // 拿到任务
         task.batch_id = batch_id;
 #ifdef USE_ASCEND_HETEROGENEOUS
         task.request = const_cast<Transport::TransferRequest *>(&request);
@@ -123,11 +125,11 @@ Status MultiTransport::submitTransfer(
         task.request = &request;
 #endif
         ++task_id;
-        submit_tasks[transport].push_back(&task);
+        submit_tasks[transport].push_back(&task);           // 将任务添加到对应协议的列表中
     }
     Status overall_status = Status::OK();
     for (auto &entry : submit_tasks) {
-        auto status = entry.first->submitTransferTask(entry.second);
+        auto status = entry.first->submitTransferTask(entry.second);  // 批量提交任务到各自传输后端，这样有个好处：对于 rdma、tcp 等都可以在内部各自合并任务，减少开销提高性能。
         if (!status.ok()) {
             // LOG(ERROR) << "Failed to submit transfer task to "
             //            << entry.first->getName();
@@ -222,6 +224,7 @@ Status MultiTransport::getBatchTransferStatus(BatchID batch_id,
     return Status::OK();
 }
 
+// 根据编译选项 + 运行时环境决定安装哪些协议。可以安装多个协议。
 Transport *MultiTransport::installTransport(const std::string &proto,
                                             std::shared_ptr<Topology> topo) {
     Transport *transport = nullptr;
@@ -245,7 +248,7 @@ Transport *MultiTransport::installTransport(const std::string &proto,
 #endif
 #ifdef USE_ASCEND_DIRECT
     else if (std::string(proto) == "ascend") {
-        transport = new AscendDirectTransport();
+        transport = new AscendDirectTransport();            // 这里 new 了个什么玩意呢？
     }
 #endif
 #ifdef USE_ASCEND
@@ -336,18 +339,18 @@ Transport *MultiTransport::installTransport(const std::string &proto,
         return nullptr;
     }
 
-    transport_map_[proto] = std::shared_ptr<Transport>(transport);
+    transport_map_[proto] = std::shared_ptr<Transport>(transport);          // 把 Transport 智能指针存入 map，transport_map_ 的内容由上面一大串的 if-else 决定
     return transport;
 }
 
 Status MultiTransport::selectTransport(const TransferRequest &entry,
                                        Transport *&transport) {
-    auto target_segment_desc = metadata_->getSegmentDescByID(entry.target_id);
+    auto target_segment_desc = metadata_->getSegmentDescByID(entry.target_id);      // 根据target_id获取segment_desc
     if (!target_segment_desc) {
         return Status::InvalidArgument("Invalid target segment ID " +
                                        std::to_string(entry.target_id));
     }
-    auto proto = target_segment_desc->protocol;
+    auto proto = target_segment_desc->protocol;         // 拿到 Segment desc 里的protocol
 #ifdef USE_ASCEND_HETEROGENEOUS
     // When USE_ASCEND_HETEROGENEOUS is enabled:
     // - Target side directly reuses RDMA Transport
@@ -355,12 +358,16 @@ Status MultiTransport::selectTransport(const TransferRequest &entry,
     if (target_segment_desc->protocol == "rdma") {
         proto = "ascend";
     }
+    // TODO(timskyzhang): Add explicit warning or error handling when
+    // USE_ASCEND_HETEROGENEOUS is enabled but target protocol is not "rdma".
+    // Currently non-rdma targets silently fall through and fail with a
+    // generic "Transport not installed" error, which is not user-friendly.
 #endif
     if (!transport_map_.count(proto)) {
         return Status::NotSupportedTransport("Transport " + proto +
                                              " not installed");
     }
-    transport = transport_map_[proto].get();
+    transport = transport_map_[proto].get();            // 据协议名从 map 里查到对应的 Transport 智能指针，然后把裸指针交给调用者使用。这里从 map 查到的是共享指针，get 会把智能指针（共享指针）转换回裸指针，这样可以稍微减少开销。
     return Status::OK();
 }
 

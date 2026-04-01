@@ -88,13 +88,14 @@ TransferEnginePy::TransferEnginePy() {
     }
 }
 
+// 析构函数：释放资源
 TransferEnginePy::~TransferEnginePy() {
     for (auto &handle : handle_map_) engine_->closeSegment(handle.second);
     handle_map_.clear();
     engine_.reset();
-    for (auto &buffer : buffer_list_) freeMemory(buffer);
+    for (auto &buffer : buffer_list_) freeMemory(buffer);       // 释放 Slab，BuddyAllocator 管理的
     buffer_list_.clear();
-    for (auto &buffer : large_buffer_list_) freeMemory(buffer);
+    for (auto &buffer : large_buffer_list_) freeMemory(buffer);     // 释放超大块，手动申请的 allocateRawBuffer
     large_buffer_list_.clear();
 }
 
@@ -229,7 +230,10 @@ int TransferEnginePy::getRpcPort() { return engine_->getRpcPort(); }
 char *TransferEnginePy::allocateRawBuffer(size_t capacity) {
     auto buffer = allocateMemory(capacity);
     if (!buffer) return nullptr;
-    int ret = engine_->registerLocalMemory(buffer, capacity, kWildcardLocation);
+    // 透传，把参数原封不动地交给 impl_（具体实现类）。这是典型的 Pimpl 模式（Pointer to Implementation）
+    // 这里三个参数的意义分别是：buffer 地址，容量（也就是 buffer 大小，也就是 rdma 填写 wr 要用到的 len），location
+    int ret = engine_->registerLocalMemory(buffer, capacity, kWildcardLocation);        
+
     if (ret) {
         freeMemory(buffer);
         return nullptr;
@@ -237,6 +241,7 @@ char *TransferEnginePy::allocateRawBuffer(size_t capacity) {
     return (char *)buffer;
 }
 
+// 分类 ID 计算器：当 size 大于 256MB 时候，返回 -1；当小于等于 256MB 时候，返回对应的 class_id
 int TransferEnginePy::findClassId(size_t size) {
     if (size > 1024ull * kSlabSizeKB[kMaxClassId]) return -1;
     for (int i = kMaxClassId - 1; i >= 0; --i)
@@ -244,37 +249,47 @@ int TransferEnginePy::findClassId(size_t size) {
     return 0;
 }
 
+// buddy 分配器
 int TransferEnginePy::doBuddyAllocate(int class_id) {
+    // 触顶（递归终止条件）：class_id 达到最大值，通过 allocateRawBuffer 申请一个 2GB 的大 buffer
     if (class_id == kMaxClassId) {
-        auto buffer = allocateRawBuffer(kDefaultBufferCapacity);
-        buffer_list_.push_back(buffer);
+        auto buffer = allocateRawBuffer(kDefaultBufferCapacity);        // 在头文件里定义的，2GB
+        buffer_list_.push_back(buffer);         // 将 buffer 放入 buffer_list_ 中，方便后续释放（bufferlist 的唯一用处）
+        // 根据 offset 将申请到的 2GB 的 buffer 划分成 8*256MB 的小格子（slab）
+        // 完成 free list 的初始化——最开始是只有最大 size 的 slab，也就是 256MB。在下面递归的地方切分成更小的 slab（最小 8KB）
         for (size_t offset = 0; offset < kDefaultBufferCapacity;
-             offset += 1024ull * kSlabSizeKB[kMaxClassId])
+             offset += 1024ull * kSlabSizeKB[kMaxClassId])      // kSlabSizeKB是一个规定各个等级 size 的数组，，而 kMaxClassId 是数组的长度，则 kSlabSizeKB[kMaxClassId] 是这个数组最后一个元素，也就是 256 KB；再乘 1024ull 就是 256MB，也就是 buddy 分配器划分时候的步长
             free_list_[kMaxClassId].push(buffer + offset);
         return 0;
     }
+    // 递归 ！！假如上一级（class_id+1）也没有空余 buffer 了，递归！看上上级（class_id+2）有没有空余，直到触顶！
     if (free_list_[class_id + 1].empty()) {
         int ret = doBuddyAllocate(class_id + 1);
-        if (ret) return ret;
+        if (ret) return ret;            // 假如 doBuddyAllocate 返回非 0，也就是发生错误，这地方可以弹出去；为 0 的话不会触发 if 分支
     }
+
+    // 上一级有空余 buffer 的情况 
     assert(!free_list_[class_id + 1].empty());
-    char *buffer = free_list_[class_id + 1].top();
-    free_list_[class_id + 1].pop();
-    free_list_[class_id].push(buffer);
-    free_list_[class_id].push(buffer + kSlabSizeKB[class_id] * 1024);
+    char *buffer = free_list_[class_id + 1].top();      // .top() 拿到上一级的栈顶元素的引用 vector<stack<char*>> 栈里存的是地址（char*）top 就是拿到这个元素，也就是地址
+    free_list_[class_id + 1].pop();         // 从上一级的 free list 里弹出栈顶元素——指向上级大小的 buffer 的指针
+    free_list_[class_id].push(buffer);      // 把那个 buffer 的地址填进当前 classid
+    free_list_[class_id].push(buffer + kSlabSizeKB[class_id] * 1024);           // 计算 offset，把对应的地址指针push进当前 classid 对应的 stack
     return 0;
 }
 
+// 内存池设计，减少 RDMA 内存注册注销操作（非常昂贵，需要双边通信以及 CPU 参与）
 uintptr_t TransferEnginePy::allocateManagedBuffer(size_t length) {
     std::lock_guard<std::mutex> guard(mutex_);
+    // findClassId 相当于一个分类的小工具，根据得到的 id 进入不同的分支
     int class_id = findClassId(length);
     if (class_id < 0) {
         char *buffer = allocateRawBuffer(length);
         if (buffer) large_buffer_list_.insert(buffer);
         return (uintptr_t)buffer;
     }
-    if (free_list_[class_id].empty())
+    if (free_list_[class_id].empty())       // 如果空闲列表为空，也就是说等级为这个 class_id 的栈里是空的，没有这个大小的空闲 buffer 了，使用 buddy 分配器进行分配——递归向上级申请资源
         if (doBuddyAllocate(class_id)) return 0;
+
     assert(!free_list_[class_id].empty());
     char *buffer = free_list_[class_id].top();
     free_list_[class_id].pop();
@@ -287,10 +302,11 @@ int TransferEnginePy::freeManagedBuffer(uintptr_t buffer_addr, size_t length) {
     int class_id = findClassId(length);
     if (class_id < 0) {
         large_buffer_list_.erase(buffer);
-        engine_->unregisterLocalMemory(buffer);
+        engine_->unregisterLocalMemory(buffer);     // 超大块是手动注销的（unregister）
         freeMemory(buffer);
         return 0;
     }
+    // 普通块：只放回（还是把 buffer 的地址（一个 char*）push 到 该层对应的 stack） free list，不真正释放
     free_list_[class_id].push(buffer);
     return 0;
 }
@@ -935,6 +951,7 @@ uintptr_t TransferEnginePy::getFirstBufferAddress(
     Transport::SegmentHandle segment_id =
         engine_->openSegment(segment_name.c_str());
     auto segment_desc = engine_->getMetadata()->getSegmentDescByID(segment_id);
+    // 如果segment_desc为空或者buffers为空，返回0
     if (!segment_desc || segment_desc->buffers.empty()) {
         return 0;
     }

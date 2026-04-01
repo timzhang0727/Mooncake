@@ -242,6 +242,7 @@ int RdmaContext::registerMemoryRegionInternal(void *addr, size_t length,
             return ERR_CONTEXT;
         }
 
+        // 拿到 dmabuf fd （file description）
         int dmabuf_fd;
         result = cuMemGetHandleForAddressRange(
             &dmabuf_fd, (CUdeviceptr)addr, allocSize,
@@ -255,11 +256,11 @@ int RdmaContext::registerMemoryRegionInternal(void *addr, size_t length,
         }
         mrMeta.addr = addr;
         mrMeta.mr = ibv_reg_dmabuf_mr(pd_, 0 /* offset */, length,
-                                      (uintptr_t)addr, dmabuf_fd, access);
+                                      (uintptr_t)addr, dmabuf_fd, access);              // 根据上面拿到的 fd，调用新的用户态的 ibv_reg_dmabuf_mr()完成 gpu 内存的注册（这条通路不依赖 peermem）
     }
 #else
     mrMeta.addr = addr;
-    mrMeta.mr = ibv_reg_mr(pd_, addr, length, access);
+    mrMeta.mr = ibv_reg_mr(pd_, addr, length, access);              // 这个分支被编译的条件：没有 cuda（只是 host 内存）；或者有 cuda 且有 nvidia-peermem，此时 peermem 会让ibv_reg_mr() 透明地支持 GPU 内存，不需要应用层做额外处理。peermem 太牛了。争取华为这边也能支持这种透明传递能力。
 #endif
     if (!mrMeta.mr) {
         PLOG(ERROR) << "Failed to register memory " << addr;

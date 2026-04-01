@@ -422,8 +422,13 @@ Status HeterogeneousRdmaTransport::submitTransferTask(
     auto &task = *task_list[0];
     auto &request = *task.request;
 
+    // 这里从 multi-transport，select-transport 在
+        // 1. 编译时启用 昇腾异构 FLAG
+        // 2. 对端（target）的 Segment 的 desc 里的协议是 rdma
+        // 3，在满足 1、2 的条件下，编译器会进入到昇腾异构分支
+    // 因此这里是完全有可能拿到 cpu 内存的
     if (isCpuMemory(request.source)) {
-        return transport_->submitTransferTask(task_list);
+        return transport_->submitTransferTask(task_list);           // CPU 内存直接提交
     }
 
     auto ret = checkAndCreateStreamCopy();
@@ -435,11 +440,11 @@ Status HeterogeneousRdmaTransport::submitTransferTask(
     }
 
     {
-        std::lock_guard<std::mutex> lock(memcpy_mutex_);
+        std::lock_guard<std::mutex> lock(memcpy_mutex_);            // 锁
         if (request.length >= AGGREGATE_SIZE_LIMIT) {
-            return noAggTransport(task_list);
+            return noAggTransport(task_list);                       // 大块（超过size-limit 的）直接传输：逐个 D2H 拷贝到 host，再走 RDMA
         } else {
-            return aggTransport(task_list);
+            return aggTransport(task_list);                         // 小块聚合传输：先在设备端聚合（D2H），再批量传输
         }
     }
 

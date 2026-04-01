@@ -192,9 +192,9 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
     int ret = metadata_->addRpcMetaEntry(local_server_name_, desc);
     if (ret) return ret;
 
-#if defined(USE_ASCEND) || defined(USE_ASCEND_DIRECT)
+#if defined(USE_ASCEND) || defined(USE_ASCEND_DIRECT)           // 第一层 ascend
     Transport* ascend_transport =
-        multi_transports_->installTransport("ascend", local_topology_);
+        multi_transports_->installTransport("ascend", local_topology_);     // 跳到 mooncake-transfer-engine/src/multi_transport.cpp installTransport
     if (!ascend_transport) {
         LOG(ERROR) << "Failed to install Ascend transport";
         return -1;
@@ -484,6 +484,7 @@ int TransferEngineImpl::registerLocalMemory(void* addr, size_t length,
     }
 
     std::unique_lock<std::shared_mutex> lock(mutex_);
+    // 每次完成注册，都更新本地内存区域列表。pushback 是什么？答：向 vector 尾巴添加一个元素，类似于 append，但是注意 cpp 容器可能会触发扩容……
     local_memory_regions_.push_back(
         {addr, length, location, remote_accessible});
     return 0;
