@@ -199,6 +199,7 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
         LOG(ERROR) << "Failed to install Ascend transport";
         return -1;
     }
+    // 假如是直连，Line202 下面的 else 分支都不会进入
 #else
 
 #ifdef USE_UBSHMEM
@@ -223,8 +224,12 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
     }
 #endif
 
+    // 拓扑自动发现，ADT 用不到，因为它的拓扑发现是 adxl 在做
+    // （timskyzhang） TODO：adt 的拓扑发现动作能不能复用 Mooncake 的发现逻辑，让整体更简单？
     if (auto_discover_) {
         LOG(INFO) << "Auto-discovering topology...";
+
+        // 支持自定义拓扑文件，无需自动发现（比较适合机房场景？）
         if (getenv("MC_CUSTOM_TOPO_JSON")) {
             auto path = getenv("MC_CUSTOM_TOPO_JSON");
             LOG(INFO) << "Using custom topology from: " << path;

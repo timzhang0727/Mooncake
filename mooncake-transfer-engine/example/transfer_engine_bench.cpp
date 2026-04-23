@@ -355,26 +355,38 @@ Status initiatorWorker(TransferEngine *engine, SegmentID segment_id,
         (uint64_t)segment_desc->buffers[thread_id % buffer_num].addr;
 
     size_t batch_count = 0;
+
+    // Main loop（HOT）
     while (running) {
+        // 分配 batch_id，声明这一轮要提交 FLAGS_batch_size 个传输任务。
         auto batch_id = engine->allocateBatchID(FLAGS_batch_size);
         Status s;
         std::vector<TransferRequest> requests;
+
+        // 构造传输请求 — 填充 TransferRequest
         for (int i = 0; i < FLAGS_batch_size; ++i) {
             TransferRequest entry;
             entry.opcode = opcode;
             entry.length = FLAGS_block_size;
+            // 本地源地址 = 基址 + block_size * 全局块索引
+            // 全局块索引 = i * FLAGS_threads + thread_id（线程间交错排列，拒绝连续内存访问，模拟真实场景下 kvcache 分散排布的特性）
             entry.source = (uint8_t *)(addr) +
                            FLAGS_block_size * (i * FLAGS_threads + thread_id);
             entry.target_id = segment_id;
+            // 远端目标偏移：与本地采用相同的交错寻址，保证本地块与远端块一一对应
             entry.target_offset =
                 remote_base +
                 FLAGS_block_size * (i * FLAGS_threads + thread_id);
             requests.emplace_back(entry);
         }
 
+        // Step 3: 提交整批传输请求（引擎内部做拓扑感知路由、分片、RDMA 下发）
         s = engine->submitTransfer(batch_id, requests);
         if (!s.ok()) LOG(ERROR) << s.ToString();
         LOG_ASSERT(s.ok());
+
+        // Step 4: 逐个 busy-poll 每个 task（忙等，零 sleep，保证最低检测延迟）
+        //         先等 task 0 完成，再等 task 1……串行轮询
         for (int task_id = 0; task_id < FLAGS_batch_size; ++task_id) {
             bool completed = false;
             TransferStatus status;
@@ -391,11 +403,13 @@ Status initiatorWorker(TransferEngine *engine, SegmentID segment_id,
             }
         }
 
+        // Step 5: 释放 batch 句柄，归还引擎内部资源
         s = engine->freeBatchID(batch_id);
         LOG_ASSERT(s.ok());
         batch_count++;
     }
     LOG(INFO) << "Worker " << thread_id << " stopped!";
+    // 汇总本线程完成的 batch 数到全局计数器，用于计算总吞吐量
     total_batch_count.fetch_add(batch_count);
     return Status::OK();
 }
